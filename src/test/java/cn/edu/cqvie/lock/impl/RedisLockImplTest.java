@@ -1,16 +1,15 @@
 package cn.edu.cqvie.lock.impl;
 
 import cn.edu.cqvie.lock.RedisLock;
-import org.junit.Test;
-import org.junit.runner.RunWith;
+import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.test.context.junit4.SpringRunner;
 
 import java.util.ArrayList;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.*;
@@ -24,7 +23,6 @@ import java.util.concurrent.*;
  * @version 1.0.0
  * @since 1.7
  */
-@RunWith(SpringRunner.class)
 @SpringBootTest
 public class RedisLockImplTest {
 
@@ -38,43 +36,46 @@ public class RedisLockImplTest {
     @Test
     public void lock() {
         // 初始化库存
-        redisTemplate.opsForValue().set("goods-seckill", "10");
-        List<Future> futureList = new ArrayList<>();
+        redisTemplate.opsForValue().set("goods-flash-sale", "1");
 
-        for (int i = 0; i < 100; i++) {
-            futureList.add(executors.submit(this::seckill));
+        for (int i = 0; i < 16; i++) {
+            executors.submit(this::flashSale);
             try {
-                Thread.sleep(100);
+                Thread.sleep(500);
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
         }
 
-        // 等待结果，防止主线程退出
-        futureList.forEach(action -> {
-            try {
-                action.get();
-            } catch (InterruptedException | ExecutionException e) {
-                e.printStackTrace();
+        //等待执行结果
+        executors.shutdown();
+        while (true) {
+            if (executors.isTerminated()) {
+                break;
+            } else {
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
             }
-        });
-
+        }
     }
 
-    public int seckill() {
-        String key = "goods";
+    public int flashSale() {
+        String key = "goods-flash-sale-lock";
         try {
             redisLock.lock(key);
-            int num = Integer.valueOf(Objects.requireNonNull(redisTemplate.opsForValue().get("goods-seckill")));
+            int num = Integer.parseInt(Objects.requireNonNull(redisTemplate.opsForValue().get("goods-flash-sale")));
             if (num > 0) {
-                redisTemplate.opsForValue().set("goods-seckill", String.valueOf(--num));
+                redisTemplate.opsForValue().set("goods-flash-sale", String.valueOf(--num));
                 logger.info("秒杀成功，剩余库存：{}", num);
             } else {
                 logger.error("秒杀失败，剩余库存：{}", num);
             }
             return num;
         } catch (Throwable e) {
-            logger.error("seckill exception", e);
+            logger.error("flash sale exception", e);
         } finally {
             redisLock.unlock(key);
         }

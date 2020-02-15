@@ -13,6 +13,7 @@ import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.serializer.RedisSerializer;
 import org.springframework.stereotype.Component;
 
+import java.util.Objects;
 import java.util.UUID;
 
 /**
@@ -53,7 +54,7 @@ public class RedisLockImpl extends AbstractRedisLock {
 
     public boolean tryLock(String key, long expire) {
         try {
-            return Converters.stringToBoolean(redisTemplate.execute((RedisCallback<String>) connection -> {
+            return Converters.stringToBoolean(Objects.requireNonNull(redisTemplate.execute((RedisCallback<String>) connection -> {
                 Object nativeConnection = connection.getNativeConnection();
                 String uuid = UUID.randomUUID().toString();
                 threadLocal.set(uuid);
@@ -73,7 +74,7 @@ public class RedisLockImpl extends AbstractRedisLock {
                             .set(k, v, SetArgs.Builder.nx().px(expire));
                 }
                 return "";
-            }));
+            })));
         } catch (Throwable e) {
             e.printStackTrace();
             logger.error("set redis occurred an exception", e);

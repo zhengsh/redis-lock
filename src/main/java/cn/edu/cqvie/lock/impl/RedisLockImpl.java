@@ -84,10 +84,9 @@ public class RedisLockImpl extends AbstractRedisLock {
 
     @Override
     public boolean lock(String key, long expire, long retryTimes) {
+        long start = System.currentTimeMillis();
         boolean result = tryLock(key, expire);
-
-        while (!result && retryTimes-- > 0) {
-            long start = System.currentTimeMillis();
+        while (!result && --retryTimes > 0) {
             try {
                 logger.debug("lock failed, retrying...{}", retryTimes);
                 Thread.sleep(SLEEP_MILLIS);

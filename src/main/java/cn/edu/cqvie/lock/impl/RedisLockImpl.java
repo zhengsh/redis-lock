@@ -13,12 +13,18 @@ import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.serializer.RedisSerializer;
 import org.springframework.stereotype.Component;
 
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * ClassName: RedisLockImpl. <br/>
  * Description: Redis分布式锁实现. <br/>
  * Date: 2019-01-23. <br/>
+ * todo 重入
+ * todo 自动续期
  *
  * @author zhengsh
  * @version 1.0.0
@@ -27,7 +33,9 @@ import java.util.UUID;
 @Component
 public class RedisLockImpl extends AbstractRedisLock {
 
-    private Logger logger = LoggerFactory.getLogger(getClass());
+    private Logger log = LoggerFactory.getLogger(getClass());
+    Map<String, AtomicBoolean> lockMap = new ConcurrentHashMap<>(128);
+    Map<String, BlockingQueue<DelayedThread>> waitersMap = new ConcurrentHashMap<>(128);
 
     @Autowired
     private RedisTemplate<String, String> redisTemplate;
@@ -76,7 +84,7 @@ public class RedisLockImpl extends AbstractRedisLock {
             }));
         } catch (Throwable e) {
             e.printStackTrace();
-            logger.error("set redis occurred an exception", e);
+            log.error("set redis occurred an exception", e);
         }
         return false;
     }
@@ -84,17 +92,60 @@ public class RedisLockImpl extends AbstractRedisLock {
 
     @Override
     public boolean lock(String key, long expire, long retryTimes) {
-        long start = System.currentTimeMillis();
         boolean result = tryLock(key, expire);
-        while (!result && --retryTimes > 0) {
-            try {
-                logger.debug("lock failed, retrying...{}", retryTimes);
-                Thread.sleep(SLEEP_MILLIS);
-            } catch (InterruptedException e) {
-                return false;
+        if (!result) {
+            final long deadline = System.currentTimeMillis() + retryTimes;
+            AtomicBoolean locked = lockMap.get(key);
+            BlockingQueue<DelayedThread> waiters = waitersMap.get(key);
+            if (locked == null) {
+                locked = new AtomicBoolean(false);
+                synchronized (lockMap) {
+                    lockMap.put(key, locked);
+                }
             }
-            result = tryLock(key, expire);
-            retryTimes -= (System.currentTimeMillis() - start);
+            if (waiters == null) {
+                waiters = new DelayQueue<>();
+                synchronized (waiters) {
+                    waitersMap.put(key, waiters);
+                }
+            }
+            //1.本地排队抢占 CPU 时间片
+            Thread current = Thread.currentThread();
+            waiters.add(new DelayedThread(current, deadline));
+
+            //cas
+            boolean wasInterrupted = false;
+            assert waiters.peek() != null;
+            while (waiters.peek().getThread() != current ||
+                    !locked.compareAndSet(false, true)) {
+                LockSupport.park(this);
+                //等待时忽略中断
+                System.out.println("等待时忽略中断");
+                if (Thread.interrupted()) {
+                    wasInterrupted = true;
+                }
+            }
+
+            //2.抢到了本地CPU时间片，开始去申请 Redis 共享Key
+            while (--retryTimes > 0) {
+                try {
+                    log.info("lock failed：{}, retrying...{}", current, retryTimes);
+                    Thread.sleep(SLEEP_MILLIS);
+                } catch (InterruptedException e) {
+                    return false;
+                }
+                //重试
+                result = tryLock(key, expire);
+                //计算重试时间
+                retryTimes = deadline - System.currentTimeMillis();
+            }
+
+            //退出时删除信息
+            waiters.remove();
+            //退出时重新设置中断状态
+            if (wasInterrupted) {
+                current.interrupt();
+            }
         }
         return result;
     }
@@ -102,6 +153,14 @@ public class RedisLockImpl extends AbstractRedisLock {
     @Override
     public boolean unlock(String key) {
         try {
+            AtomicBoolean locked = lockMap.get(key);
+            if (locked != null) {
+                locked.set(false);
+            }
+            BlockingQueue<DelayedThread> waiters = waitersMap.get(key);
+            if (waiters != null && waiters.peek() != null && waiters.peek().getThread() != null) {
+                LockSupport.unpark(waiters.peek().getThread());
+            }
             Object[] keys = new Object[]{serialize(key)};
             Object[] values = new Object[]{serialize(threadLocal.get())};
             Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
@@ -118,7 +177,7 @@ public class RedisLockImpl extends AbstractRedisLock {
             });
             return result != null && result > 0;
         } catch (Throwable e) {
-            logger.warn("unlock occurred an exception", e);
+            log.warn("unlock occurred an exception", e);
         } finally {
             //清除掉ThreadLocal中的数据，避免内存溢出
             threadLocal.remove();
@@ -131,5 +190,43 @@ public class RedisLockImpl extends AbstractRedisLock {
                 (RedisSerializer<String>) redisTemplate.getKeySerializer();
         //lettuce连接包下序列化键值，否则无法用默认的ByteArrayCodec解析
         return stringRedisSerializer.serialize(key);
+    }
+
+    public static class DelayedThread implements Delayed {
+
+        private Thread thread;
+        private Long timeout;
+
+        public DelayedThread(Thread thread, Long timeout) {
+            this.thread = thread;
+            this.timeout = timeout;
+        }
+
+        public Long getTimeout() {
+            return timeout;
+        }
+
+        public void setTimeout(Long timeout) {
+            this.timeout = timeout;
+        }
+
+        public Thread getThread() {
+            return thread;
+        }
+
+        public void setThread(Thread thread) {
+            this.thread = thread;
+        }
+
+        @Override
+        public long getDelay(TimeUnit unit) {
+            long currentTime = System.currentTimeMillis();
+            return unit.convert(this.timeout - currentTime, TimeUnit.MILLISECONDS);
+        }
+
+        @Override
+        public int compareTo(Delayed o) {
+            return (int) (this.getDelay(TimeUnit.MILLISECONDS) - o.getDelay(TimeUnit.MILLISECONDS));
+        }
     }
 }

@@ -33,12 +33,12 @@ public class RedisLockImplTest {
     @Test
     public void lock() {
         // 初始化库存
-        redisTemplate.opsForValue().set("goods-flash-sale", "1");
+        redisTemplate.opsForValue().set("goods-flash-sale", "10");
 
         for (int i = 0; i < 16; i++) {
             executors.submit(this::flashSale);
             try {
-                Thread.sleep(500);
+                Thread.sleep(10);
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
@@ -63,6 +63,7 @@ public class RedisLockImplTest {
         String key = "goods-flash-sale-lock";
         try {
             redisLock.lock(key);
+            Thread.sleep(5000);
             int num = Integer.parseInt(Objects.requireNonNull(redisTemplate.opsForValue().get("goods-flash-sale")));
             if (num > 0) {
                 redisTemplate.opsForValue().set("goods-flash-sale", String.valueOf(--num));

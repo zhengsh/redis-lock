@@ -7,6 +7,8 @@ import io.lettuce.core.cluster.api.async.RedisAdvancedClusterAsyncCommands;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.config.ConfigurableBeanFactory;
+import org.springframework.context.annotation.Scope;
 import org.springframework.data.redis.connection.convert.Converters;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -15,10 +17,13 @@ import org.springframework.stereotype.Component;
 
 import java.util.Map;
 import java.util.Objects;
+import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
+
+import static org.springframework.beans.factory.config.ConfigurableBeanFactory.SCOPE_PROTOTYPE;
 
 /**
  * ClassName: RedisLockImpl. <br/>
@@ -30,18 +35,24 @@ import java.util.concurrent.locks.LockSupport;
  * @since 1.7
  */
 @Component
+@Scope(SCOPE_PROTOTYPE)
 public class RedisLockImpl extends AbstractRedisLock {
 
     private Logger log = LoggerFactory.getLogger(getClass());
-    Map<String, AtomicBoolean> lockMap = new ConcurrentHashMap<>(128);
-    Map<String, BlockingQueue<DelayedThread>> waitersMap = new ConcurrentHashMap<>(128);
 
     @Autowired
     private RedisTemplate<String, String> redisTemplate;
-    private ThreadLocal<String> threadLocal = new ThreadLocal<String>();
+
+    private final AtomicBoolean locked = new AtomicBoolean(false);
+    private final Queue<Thread> waiters = new ConcurrentLinkedQueue<Thread>();
+
     private static final String UNLOCK_LUA;
     private static final String RENEWAL_LUA;
-    private ScheduledExecutorService executorService = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors() * 2);
+
+    private ThreadLocal<String> threadLocal = new ThreadLocal<String>();
+
+    private ScheduledExecutorService executorService =
+            Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors() * 2);
 
     static {
         StringBuilder sb = new StringBuilder();
@@ -112,7 +123,7 @@ public class RedisLockImpl extends AbstractRedisLock {
      * @param retryTimes 重试获取锁的retry最大时间，默认2s  (单位毫秒)
      * @return 是否获取到锁
      * @implNote 步骤描述：
-     * 1. 首先尝试直接获取锁
+     * 1.首先尝试直接获取锁
      * 2.如果获取锁失败，那么就先进行本地排队
      * 3.如果本地排队获得执行权，那么就进行再次尝试
      * 4.如果获取成功，退出
@@ -121,40 +132,24 @@ public class RedisLockImpl extends AbstractRedisLock {
      */
     @Override
     public boolean lock(String key, long expire, long retryTimes) {
+        //1.本地排队抢占 CPU 时间片
+        boolean wasInterrupted = false;
+        Thread current = Thread.currentThread();
+        waiters.add(current);
+
+        //cas
+        while (waiters.peek() != current ||
+                !locked.compareAndSet(false, true)) {
+            LockSupport.park(this);
+            // ignore interrupts while waiting
+            if (Thread.interrupted()) {
+                wasInterrupted = true;
+            }
+        }
+
         boolean result = tryLock(key, expire);
         if (!result) {
             final long deadline = System.currentTimeMillis() + retryTimes;
-            AtomicBoolean locked = lockMap.get(key);
-            BlockingQueue<DelayedThread> waiters = waitersMap.get(key);
-            if (locked == null) {
-                locked = new AtomicBoolean(false);
-                synchronized (lockMap) {
-                    lockMap.put(key, locked);
-                }
-            }
-            if (waiters == null) {
-                waiters = new DelayQueue<>();
-                synchronized (waiters) {
-                    waitersMap.put(key, waiters);
-                }
-            }
-            //1.本地排队抢占 CPU 时间片
-            Thread current = Thread.currentThread();
-            waiters.add(new DelayedThread(current, deadline));
-
-            //cas
-            boolean wasInterrupted = false;
-            assert waiters.peek() != null;
-            while (waiters.peek().getThread() != current ||
-                    !locked.compareAndSet(false, true)) {
-                LockSupport.park(this);
-                //等待时忽略中断
-                System.out.println("等待时忽略中断");
-                if (Thread.interrupted()) {
-                    wasInterrupted = true;
-                }
-            }
-
             //2.抢到了本地CPU时间片，开始去申请 Redis 共享Key
             while (--retryTimes > 0) {
                 try {
@@ -198,10 +193,10 @@ public class RedisLockImpl extends AbstractRedisLock {
 
                     if (nativeConnection instanceof RedisAsyncCommands) {
                         RedisAsyncCommands commands = (RedisAsyncCommands) nativeConnection;
-                        return (Long) commands.getStatefulConnection().sync().eval(UNLOCK_LUA, ScriptOutputType.INTEGER, keys, values);
+                        return (Long) commands.getStatefulConnection().sync().eval(RENEWAL_LUA, ScriptOutputType.INTEGER, keys, values);
                     } else if (nativeConnection instanceof RedisAdvancedClusterAsyncCommands) {
                         RedisAdvancedClusterAsyncCommands commands = (RedisAdvancedClusterAsyncCommands) nativeConnection;
-                        return (Long) commands.getStatefulConnection().sync().eval(UNLOCK_LUA, ScriptOutputType.INTEGER, keys, values);
+                        return (Long) commands.getStatefulConnection().sync().eval(RENEWAL_LUA, ScriptOutputType.INTEGER, keys, values);
                     }
                     return 0L;
                 });
@@ -215,14 +210,6 @@ public class RedisLockImpl extends AbstractRedisLock {
     @Override
     public boolean unlock(String key) {
         try {
-            AtomicBoolean locked = lockMap.get(key);
-            if (locked != null) {
-                locked.set(false);
-            }
-            BlockingQueue<DelayedThread> waiters = waitersMap.get(key);
-            if (waiters != null && waiters.peek() != null && waiters.peek().getThread() != null) {
-                LockSupport.unpark(waiters.peek().getThread());
-            }
             Object[] keys = new Object[]{serialize(key)};
             Object[] values = new Object[]{serialize(threadLocal.get())};
             Long result = redisTemplate.execute((RedisCallback<Long>) connection -> {
@@ -237,6 +224,10 @@ public class RedisLockImpl extends AbstractRedisLock {
                 }
                 return 0L;
             });
+
+            locked.set(false);
+            LockSupport.unpark(waiters.peek());
+
             return result != null && result > 0;
         } catch (Throwable e) {
             log.warn("unlock occurred an exception", e);

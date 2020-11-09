@@ -14,6 +14,7 @@ import org.springframework.data.redis.serializer.RedisSerializer;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -23,8 +24,6 @@ import java.util.concurrent.locks.LockSupport;
  * ClassName: RedisLockImpl. <br/>
  * Description: Redis分布式锁实现. <br/>
  * Date: 2019-01-23. <br/>
- * todo 重入
- * todo 自动续期
  *
  * @author zhengsh
  * @version 1.0.0
@@ -41,6 +40,8 @@ public class RedisLockImpl extends AbstractRedisLock {
     private RedisTemplate<String, String> redisTemplate;
     private ThreadLocal<String> threadLocal = new ThreadLocal<String>();
     private static final String UNLOCK_LUA;
+    private static final String RENEWAL_LUA;
+    private ScheduledExecutorService executorService = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors() * 2);
 
     static {
         StringBuilder sb = new StringBuilder();
@@ -52,6 +53,14 @@ public class RedisLockImpl extends AbstractRedisLock {
         sb.append("end ");
         UNLOCK_LUA = sb.toString();
 
+
+        sb = new StringBuilder();
+        sb.append("if redis.call(\"GET\", KEYS[1]) == ARGV[1] then");
+        sb.append("   return redis.call(\"PEXPIRE\", KEYS[1], ARGV[2])");
+        sb.append("else");
+        sb.append("   return 0");
+        sb.append("end");
+        RENEWAL_LUA = sb.toString();
     }
 
     @Override
@@ -61,7 +70,7 @@ public class RedisLockImpl extends AbstractRedisLock {
 
     public boolean tryLock(String key, long expire) {
         try {
-            return Converters.stringToBoolean(redisTemplate.execute((RedisCallback<String>) connection -> {
+            String execute = redisTemplate.execute((RedisCallback<String>) connection -> {
                 Object nativeConnection = connection.getNativeConnection();
                 String uuid = UUID.randomUUID().toString();
                 threadLocal.set(uuid);
@@ -81,7 +90,12 @@ public class RedisLockImpl extends AbstractRedisLock {
                             .set(k, v, SetArgs.Builder.nx().px(expire));
                 }
                 return "";
-            }));
+            });
+            if (execute == null) {
+                return false;
+            } else {
+                return Converters.stringToBoolean(execute);
+            }
         } catch (Throwable e) {
             e.printStackTrace();
             log.error("set redis occurred an exception", e);
@@ -90,6 +104,21 @@ public class RedisLockImpl extends AbstractRedisLock {
     }
 
 
+    /**
+     * 获取锁
+     *
+     * @param key        获取锁的KEY
+     * @param expire     得到锁后最大持有时间，默认10s (单位毫秒)
+     * @param retryTimes 重试获取锁的retry最大时间，默认2s  (单位毫秒)
+     * @return 是否获取到锁
+     * @implNote 步骤描述：
+     * 1. 首先尝试直接获取锁
+     * 2.如果获取锁失败，那么就先进行本地排队
+     * 3.如果本地排队获得执行权，那么就进行再次尝试
+     * 4.如果获取成功，退出
+     * 5.如果获取失败，继续重试
+     * 6.如果超时返回失败
+     */
     @Override
     public boolean lock(String key, long expire, long retryTimes) {
         boolean result = tryLock(key, expire);
@@ -147,7 +176,40 @@ public class RedisLockImpl extends AbstractRedisLock {
                 current.interrupt();
             }
         }
+        automaticRenewal(result, key, expire);
         return result;
+    }
+
+    /**
+     * 自动续期
+     *
+     * @param result
+     * @param key
+     * @param expire
+     */
+    private void automaticRenewal(boolean result, String key, long expire) {
+        if (result) {
+            //自动续期
+            executorService.scheduleAtFixedRate(() -> {
+                Object[] keys = new Object[]{serialize(key)};
+                Object[] values = new Object[]{serialize(threadLocal.get())};
+                Long res = redisTemplate.execute((RedisCallback<Long>) connection -> {
+                    Object nativeConnection = connection.getNativeConnection();
+
+                    if (nativeConnection instanceof RedisAsyncCommands) {
+                        RedisAsyncCommands commands = (RedisAsyncCommands) nativeConnection;
+                        return (Long) commands.getStatefulConnection().sync().eval(UNLOCK_LUA, ScriptOutputType.INTEGER, keys, values);
+                    } else if (nativeConnection instanceof RedisAdvancedClusterAsyncCommands) {
+                        RedisAdvancedClusterAsyncCommands commands = (RedisAdvancedClusterAsyncCommands) nativeConnection;
+                        return (Long) commands.getStatefulConnection().sync().eval(UNLOCK_LUA, ScriptOutputType.INTEGER, keys, values);
+                    }
+                    return 0L;
+                });
+                if (res > 0) { //如果执行成功了继续
+                    automaticRenewal(true, key, expire);
+                }
+            }, expire / 3, expire / 3, TimeUnit.SECONDS);
+        }
     }
 
     @Override

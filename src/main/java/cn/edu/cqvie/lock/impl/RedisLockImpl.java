@@ -7,7 +7,6 @@ import io.lettuce.core.cluster.api.async.RedisAdvancedClusterAsyncCommands;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.config.ConfigurableBeanFactory;
 import org.springframework.context.annotation.Scope;
 import org.springframework.data.redis.connection.convert.Converters;
 import org.springframework.data.redis.core.RedisCallback;
@@ -16,7 +15,6 @@ import org.springframework.data.redis.serializer.RedisSerializer;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
-import java.util.Objects;
 import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.*;
@@ -35,7 +33,6 @@ import static org.springframework.beans.factory.config.ConfigurableBeanFactory.S
  * @since 1.7
  */
 @Component
-@Scope(SCOPE_PROTOTYPE)
 public class RedisLockImpl extends AbstractRedisLock {
 
     private Logger log = LoggerFactory.getLogger(getClass());
@@ -43,8 +40,9 @@ public class RedisLockImpl extends AbstractRedisLock {
     @Autowired
     private RedisTemplate<String, String> redisTemplate;
 
-    private final AtomicBoolean locked = new AtomicBoolean(false);
-    private final Queue<Thread> waiters = new ConcurrentLinkedQueue<Thread>();
+    private final Map<String, Queue<Thread>> waitersHashMap = new ConcurrentHashMap<>();
+    private final Map<String, AtomicBoolean> lockedHashMap = new ConcurrentHashMap<>();
+
 
     private static final String UNLOCK_LUA;
     private static final String RENEWAL_LUA;
@@ -133,6 +131,9 @@ public class RedisLockImpl extends AbstractRedisLock {
     @Override
     public boolean lock(String key, long expire, long retryTimes) {
         //1.本地排队抢占 CPU 时间片
+        AtomicBoolean locked = lockedHashMap.computeIfAbsent(key, k -> new AtomicBoolean(false));
+        Queue<Thread> waiters = waitersHashMap.computeIfAbsent(key, k -> new ConcurrentLinkedQueue<>());
+
         boolean wasInterrupted = false;
         Thread current = Thread.currentThread();
         waiters.add(current);
@@ -172,6 +173,9 @@ public class RedisLockImpl extends AbstractRedisLock {
             }
         }
         automaticRenewal(result, key, expire);
+        if (result) {
+            log.info("获取到锁 key[{}], thread[{}]", key, Thread.currentThread());
+        }
         return result;
     }
 
@@ -186,6 +190,7 @@ public class RedisLockImpl extends AbstractRedisLock {
         if (result) {
             //自动续期
             executorService.scheduleAtFixedRate(() -> {
+                log.warn("进入 redis lock key 续期流程 key[{}] expire[{}]", key, expire);
                 Object[] keys = new Object[]{serialize(key)};
                 Object[] values = new Object[]{serialize(threadLocal.get())};
                 Long res = redisTemplate.execute((RedisCallback<Long>) connection -> {
@@ -193,17 +198,17 @@ public class RedisLockImpl extends AbstractRedisLock {
 
                     if (nativeConnection instanceof RedisAsyncCommands) {
                         RedisAsyncCommands commands = (RedisAsyncCommands) nativeConnection;
-                        return (Long) commands.getStatefulConnection().sync().eval(RENEWAL_LUA, ScriptOutputType.INTEGER, keys, values);
+                        return (Long) commands.getStatefulConnection().sync().eval(RENEWAL_LUA, ScriptOutputType.INTEGER, keys, values, expire);
                     } else if (nativeConnection instanceof RedisAdvancedClusterAsyncCommands) {
                         RedisAdvancedClusterAsyncCommands commands = (RedisAdvancedClusterAsyncCommands) nativeConnection;
-                        return (Long) commands.getStatefulConnection().sync().eval(RENEWAL_LUA, ScriptOutputType.INTEGER, keys, values);
+                        return (Long) commands.getStatefulConnection().sync().eval(RENEWAL_LUA, ScriptOutputType.INTEGER, keys, values, expire);
                     }
                     return 0L;
                 });
                 if (res > 0) { //如果执行成功了继续
                     automaticRenewal(true, key, expire);
                 }
-            }, expire / 3, expire / 3, TimeUnit.SECONDS);
+            }, expire / 3, expire / 3, TimeUnit.MILLISECONDS);
         }
     }
 
@@ -224,6 +229,9 @@ public class RedisLockImpl extends AbstractRedisLock {
                 }
                 return 0L;
             });
+
+            AtomicBoolean locked = lockedHashMap.computeIfAbsent(key, k -> new AtomicBoolean(false));
+            Queue<Thread> waiters = waitersHashMap.computeIfAbsent(key, k -> new ConcurrentLinkedQueue<>());
 
             locked.set(false);
             LockSupport.unpark(waiters.peek());
@@ -282,4 +290,5 @@ public class RedisLockImpl extends AbstractRedisLock {
             return (int) (this.getDelay(TimeUnit.MILLISECONDS) - o.getDelay(TimeUnit.MILLISECONDS));
         }
     }
+
 }

@@ -4,7 +4,7 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 /**
- * ClassName: RedisLockAppliction. <br/>
+ * ClassName: RedisLockApplication. <br/>
  * Description: spring boot start. <br/>
  * Date: 2019-01-23. <br/>
  *

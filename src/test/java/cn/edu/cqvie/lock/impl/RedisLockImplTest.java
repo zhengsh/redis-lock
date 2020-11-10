@@ -64,7 +64,7 @@ public class RedisLockImplTest {
         try {
             redisLock.lock(key);
             logger.info("秒杀过程，获取到锁：key[{}] thread[{}]", key, Thread.currentThread());
-            Thread.sleep(15000);
+            Thread.sleep(9000);
             logger.info("秒杀过程，业务执行：key[{}] thread[{}]", key, Thread.currentThread());
 
             int num = Integer.parseInt(Objects.requireNonNull(redisTemplate.opsForValue().get("goods-flash-sale")));

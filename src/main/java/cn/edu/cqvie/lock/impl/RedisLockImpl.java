@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
 import static org.springframework.beans.factory.config.ConfigurableBeanFactory.SCOPE_PROTOTYPE;
+import static org.springframework.util.SerializationUtils.serialize;
 
 /**
  * ClassName: RedisLockImpl. <br/>
@@ -64,10 +65,11 @@ public class RedisLockImpl extends AbstractRedisLock {
 
 
         sb = new StringBuilder();
-        sb.append("if redis.call(\"GET\", KEYS[1]) == ARGV[1] then");
-        sb.append("   return redis.call(\"PEXPIRE\", KEYS[1], ARGV[2])");
-        sb.append("else");
-        sb.append("   return 0");
+        sb.append("if redis.call(\"get\", KEYS[1]) == ARGV[1] ");
+        sb.append("then ");
+        sb.append("   return redis.call(\"pexpire\", KEYS[1], ARGV[2]) ");
+        sb.append("else ");
+        sb.append("   return 0 ");
         sb.append("end");
         RENEWAL_LUA = sb.toString();
     }
@@ -189,26 +191,35 @@ public class RedisLockImpl extends AbstractRedisLock {
     private void automaticRenewal(boolean result, String key, long expire) {
         if (result) {
             //自动续期
-            executorService.scheduleAtFixedRate(() -> {
-                log.warn("进入 redis lock key 续期流程 key[{}] expire[{}]", key, expire);
-                Object[] keys = new Object[]{serialize(key)};
-                Object[] values = new Object[]{serialize(threadLocal.get())};
-                Long res = redisTemplate.execute((RedisCallback<Long>) connection -> {
-                    Object nativeConnection = connection.getNativeConnection();
+            executorService.schedule(() -> {
+                try {
+                    log.warn("进入 redis lock key 续期流程 key[{}] expire[{}]", key, expire);
+                    Object[] keys = new Object[]{serialize(key)};
+                    Object[] values = new Object[]{serialize(threadLocal.get()), serialize(String.valueOf(expire))};
 
-                    if (nativeConnection instanceof RedisAsyncCommands) {
-                        RedisAsyncCommands commands = (RedisAsyncCommands) nativeConnection;
-                        return (Long) commands.getStatefulConnection().sync().eval(RENEWAL_LUA, ScriptOutputType.INTEGER, keys, values, expire);
-                    } else if (nativeConnection instanceof RedisAdvancedClusterAsyncCommands) {
-                        RedisAdvancedClusterAsyncCommands commands = (RedisAdvancedClusterAsyncCommands) nativeConnection;
-                        return (Long) commands.getStatefulConnection().sync().eval(RENEWAL_LUA, ScriptOutputType.INTEGER, keys, values, expire);
+                    Long res = redisTemplate.execute((RedisCallback<Long>) connection -> {
+                        Object nativeConnection = connection.getNativeConnection();
+
+                        if (nativeConnection instanceof RedisAsyncCommands) {
+                            RedisAsyncCommands commands = (RedisAsyncCommands) nativeConnection;
+                            return (Long) commands.getStatefulConnection().sync().eval(RENEWAL_LUA, ScriptOutputType.INTEGER, keys, values);
+                        } else if (nativeConnection instanceof RedisAdvancedClusterAsyncCommands) {
+                            RedisAdvancedClusterAsyncCommands commands = (RedisAdvancedClusterAsyncCommands) nativeConnection;
+                            return (Long) commands.getStatefulConnection().sync().eval(RENEWAL_LUA, ScriptOutputType.INTEGER, keys, values);
+                        }
+                        return 0L;
+                    });
+                    if (res > 0) { //如果执行成功了继续
+                        log.warn("进入 redis lock key 续期流程, 续期结果成功 key[{}] expire[{}]", key, expire);
+                        automaticRenewal(true, key, expire);
+                    } else {
+                        log.warn("进入 redis lock key 续期流程, 续期结果失败 key[{}] expire[{}]", key, expire);
                     }
-                    return 0L;
-                });
-                if (res > 0) { //如果执行成功了继续
-                    automaticRenewal(true, key, expire);
+                } catch (Throwable t) {
+                    t.printStackTrace();
                 }
-            }, expire / 3, expire / 3, TimeUnit.MILLISECONDS);
+            }, expire / 3, TimeUnit.MILLISECONDS);
+
         }
     }
 
@@ -252,43 +263,4 @@ public class RedisLockImpl extends AbstractRedisLock {
         //lettuce连接包下序列化键值，否则无法用默认的ByteArrayCodec解析
         return stringRedisSerializer.serialize(key);
     }
-
-    public static class DelayedThread implements Delayed {
-
-        private Thread thread;
-        private Long timeout;
-
-        public DelayedThread(Thread thread, Long timeout) {
-            this.thread = thread;
-            this.timeout = timeout;
-        }
-
-        public Long getTimeout() {
-            return timeout;
-        }
-
-        public void setTimeout(Long timeout) {
-            this.timeout = timeout;
-        }
-
-        public Thread getThread() {
-            return thread;
-        }
-
-        public void setThread(Thread thread) {
-            this.thread = thread;
-        }
-
-        @Override
-        public long getDelay(TimeUnit unit) {
-            long currentTime = System.currentTimeMillis();
-            return unit.convert(this.timeout - currentTime, TimeUnit.MILLISECONDS);
-        }
-
-        @Override
-        public int compareTo(Delayed o) {
-            return (int) (this.getDelay(TimeUnit.MILLISECONDS) - o.getDelay(TimeUnit.MILLISECONDS));
-        }
-    }
-
 }
